@@ -13,4 +13,4 @@ Standalone pure-Rust PlayStation 1 MDEC hardware video decoder and BS bitstream 
 
 ## License
 
-Licensed under the [MIT License](LICENSE).
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT License](LICENSE-MIT) at your option.
