@@ -1,0 +1,12 @@
+[package]
+name = "libmdec"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT"
+readme = "README.md"
+description = "Standalone pure-Rust PlayStation 1 MDEC hardware video decoder and BS bitstream library"
+keywords = ["ps1", "psx", "playstation", "mdec", "video"]
+categories = ["multimedia::video", "emulators"]
+
+[dependencies]
