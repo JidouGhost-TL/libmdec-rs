@@ -30,7 +30,7 @@ pub const fn sign_extend_10(raw: u16) -> i32 {
 
 /// Clamps a dequantized coefficient to the hardware signed 11-bit range (`-1024..=1023`).
 #[inline]
-const fn clamp_i11(v: i32) -> i16 {
+pub(crate) const fn clamp_i11(v: i32) -> i16 {
     if v < -1024 {
         -1024
     } else if v > 1023 {
@@ -43,7 +43,7 @@ const fn clamp_i11(v: i32) -> i16 {
 /// Hardware AC dequantization rounding: `(val * qt * q_scale + 4) >> 3`,
 /// clamped to signed 11-bit (`-1024..=1023`).
 #[inline]
-const fn dequant_ac(level: i32, qt: u8, q_scale: i32) -> i16 {
+pub(crate) const fn dequant_ac(level: i32, qt: u8, q_scale: i32) -> i16 {
     let prod = level * (qt as i32) * q_scale;
     let val = (prod + 4) >> 3;
     clamp_i11(val)
@@ -118,6 +118,7 @@ pub fn decode_rle_block(
 #[derive(Debug, Clone)]
 pub struct RleBlockDecoder {
     in_block: bool,
+    has_ac: bool,
     q_scale: i32,
     k: usize,
     coeffs: [i16; 64],
@@ -135,6 +136,7 @@ impl RleBlockDecoder {
     pub const fn new() -> Self {
         Self {
             in_block: false,
+            has_ac: false,
             q_scale: 0,
             k: 0,
             coeffs: [0; 64],
@@ -145,6 +147,7 @@ impl RleBlockDecoder {
     #[inline]
     pub fn reset(&mut self) {
         self.in_block = false;
+        self.has_ac = false;
         self.q_scale = 0;
         self.k = 0;
         self.coeffs.fill(0);
@@ -155,6 +158,13 @@ impl RleBlockDecoder {
     #[inline]
     pub const fn is_in_block(&self) -> bool {
         self.in_block
+    }
+
+    /// Returns `true` if the most recently completed block had any AC coefficient.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn has_ac(&self) -> bool {
+        self.has_ac
     }
 
     /// Returns a reference to the current 8×8 dequantized coefficient buffer.
@@ -170,6 +180,7 @@ impl RleBlockDecoder {
     /// reaching `k >= 63`). When `true` is returned, [`Self::coeffs`] holds
     /// the finished 8×8 coefficient block, and the decoder is reset for the
     /// next block on the following call (after caller reads [`Self::coeffs`]).
+    #[inline]
     pub fn push_halfword(&mut self, hw: u16, quant_zigzag: &[u8; 64]) -> bool {
         if !self.in_block {
             if hw == EOB_HALFWORD {
@@ -177,6 +188,7 @@ impl RleBlockDecoder {
             }
             self.coeffs.fill(0);
             self.in_block = true;
+            self.has_ac = false;
             self.k = 0;
             self.q_scale = i32::from((hw >> 10) & 0x3F);
             let dc_raw = sign_extend_10(hw);
@@ -200,6 +212,7 @@ impl RleBlockDecoder {
             return true;
         }
 
+        self.has_ac = true;
         let ac_raw = sign_extend_10(hw);
         if self.q_scale == 0 {
             self.coeffs[self.k] = clamp_i11(ac_raw * 2);

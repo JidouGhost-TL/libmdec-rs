@@ -9,7 +9,7 @@
 use crate::color::{
     convert_mono_4bit, convert_mono_8bit, convert_subblock_rgb15, convert_subblock_rgb24,
 };
-use crate::idct::idct_2d;
+use crate::idct::{idct_2d_default_with_ac, idct_2d_general_with_ac};
 use crate::registers::{
     BlockId, CommandOpcode, HardwareDepth, CMD_DEPTH_SHIFT, CMD_QUANT_COLOR_BIT, CMD_SET_BIT15_BIT,
     CMD_SIGNED_BIT, CTRL_ENABLE_DMA_IN, CTRL_ENABLE_DMA_OUT, CTRL_RESET, STAT_CMD_BUSY,
@@ -76,6 +76,20 @@ impl<const N: usize> WordFifo<N> {
         true
     }
 
+    /// Bulk-pushes a slice of words using at most two contiguous copies.
+    #[inline]
+    fn push_slice(&mut self, words: &[u32]) {
+        debug_assert!(words.len() <= self.free_space());
+        let tail = (self.head + self.len) % N;
+        let first = words.len().min(N - tail);
+        self.buf[tail..tail + first].copy_from_slice(&words[..first]);
+        let rem = words.len() - first;
+        if rem > 0 {
+            self.buf[..rem].copy_from_slice(&words[first..]);
+        }
+        self.len += words.len();
+    }
+
     #[inline]
     fn pop(&mut self) -> Option<u32> {
         if self.len == 0 {
@@ -85,6 +99,21 @@ impl<const N: usize> WordFifo<N> {
         self.head = (self.head + 1) % N;
         self.len -= 1;
         Some(w)
+    }
+
+    /// Bulk-pops up to `dst.len()` words using at most two contiguous copies.
+    #[inline]
+    fn pop_into(&mut self, dst: &mut [u32]) -> usize {
+        let count = self.len.min(dst.len());
+        let first = count.min(N - self.head);
+        dst[..first].copy_from_slice(&self.buf[self.head..self.head + first]);
+        let rem = count - first;
+        if rem > 0 {
+            dst[first..count].copy_from_slice(&self.buf[..rem]);
+        }
+        self.head = (self.head + count) % N;
+        self.len -= count;
+        count
     }
 }
 
@@ -108,6 +137,7 @@ pub struct MdecDevice {
     quant_luma: [u8; 64],
     quant_chroma: [u8; 64],
     scale_table: [i16; 64],
+    is_default_scale: bool,
 
     // Control / status flags.
     dma_in_enable: bool,
@@ -152,6 +182,7 @@ impl MdecDevice {
             quant_luma: DEFAULT_QUANT_LUMA,
             quant_chroma: DEFAULT_QUANT_CHROMA,
             scale_table: DEFAULT_SCALE_TABLE,
+            is_default_scale: true,
             dma_in_enable: false,
             dma_out_enable: false,
             output_depth: HardwareDepth::Bit4,
@@ -333,6 +364,7 @@ impl MdecDevice {
                 }
                 self.words_remaining = self.words_remaining.saturating_sub(1);
                 if self.words_remaining == 0 {
+                    self.is_default_scale = self.scale_table == DEFAULT_SCALE_TABLE;
                     self.active_cmd = ActiveCommand::Idle;
                 } else {
                     self.active_cmd = ActiveCommand::SetScaleTable { index };
@@ -394,9 +426,7 @@ impl MdecDevice {
             let batch = (words.len() - written)
                 .min(self.words_remaining as usize)
                 .min(self.in_fifo.free_space());
-            for &w in &words[written..written + batch] {
-                self.in_fifo.push(w);
-            }
+            self.in_fifo.push_slice(&words[written..written + batch]);
             self.words_remaining -= batch as u32;
             written += batch;
             self.step_decode();
@@ -418,13 +448,7 @@ impl MdecDevice {
     pub fn dma_out(&mut self, out: &mut [u32]) -> usize {
         let mut read = 0;
         while read < out.len() && !self.out_fifo.is_empty() {
-            while read < out.len() {
-                let Some(w) = self.out_fifo.pop() else {
-                    break;
-                };
-                out[read] = w;
-                read += 1;
-            }
+            read += self.out_fifo.pop_into(&mut out[read..]);
             self.step_decode();
             if self.active_cmd == ActiveCommand::DecodeMacroblock
                 && self.words_remaining == 0
@@ -533,35 +557,71 @@ impl MdecDevice {
         Some(lo)
     }
 
+    #[inline(always)]
+    fn run_idct_to(
+        is_default_scale: bool,
+        scale_table: &[i16; 64],
+        rle: &RleBlockDecoder,
+        dst: &mut [i16; 64],
+    ) {
+        if is_default_scale {
+            idct_2d_default_with_ac(rle.coeffs(), rle.has_ac(), dst);
+        } else {
+            idct_2d_general_with_ac(rle.coeffs(), scale_table, rle.has_ac(), dst);
+        }
+    }
+
     fn finish_current_block(&mut self) {
         match self.output_depth {
             HardwareDepth::Bit4 => {
-                idct_2d(self.rle.coeffs(), &self.scale_table, &mut self.y_block);
+                Self::run_idct_to(
+                    self.is_default_scale,
+                    &self.scale_table,
+                    &self.rle,
+                    &mut self.y_block,
+                );
                 let mut bytes = [0u8; 32];
                 convert_mono_4bit(&self.y_block, self.output_signed, &mut bytes);
-                for chunk in bytes.chunks_exact(4) {
-                    let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    self.out_fifo.push(w);
+                let mut words = [0u32; 8];
+                for (dst, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+                    *dst = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 }
+                self.out_fifo.push_slice(&words);
                 self.current_block = BlockId::Cr;
             }
             HardwareDepth::Bit8 => {
-                idct_2d(self.rle.coeffs(), &self.scale_table, &mut self.y_block);
+                Self::run_idct_to(
+                    self.is_default_scale,
+                    &self.scale_table,
+                    &self.rle,
+                    &mut self.y_block,
+                );
                 let mut bytes = [0u8; 64];
                 convert_mono_8bit(&self.y_block, self.output_signed, &mut bytes);
-                for chunk in bytes.chunks_exact(4) {
-                    let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    self.out_fifo.push(w);
+                let mut words = [0u32; 16];
+                for (dst, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+                    *dst = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 }
+                self.out_fifo.push_slice(&words);
                 self.current_block = BlockId::Cr;
             }
             HardwareDepth::Bit15 | HardwareDepth::Bit24 => match self.current_block {
                 BlockId::Cr => {
-                    idct_2d(self.rle.coeffs(), &self.scale_table, &mut self.cr_block);
+                    Self::run_idct_to(
+                        self.is_default_scale,
+                        &self.scale_table,
+                        &self.rle,
+                        &mut self.cr_block,
+                    );
                     self.current_block = BlockId::Cb;
                 }
                 BlockId::Cb => {
-                    idct_2d(self.rle.coeffs(), &self.scale_table, &mut self.cb_block);
+                    Self::run_idct_to(
+                        self.is_default_scale,
+                        &self.scale_table,
+                        &self.rle,
+                        &mut self.cb_block,
+                    );
                     self.current_block = BlockId::Y1;
                 }
                 BlockId::Y1 => {
@@ -589,7 +649,12 @@ impl MdecDevice {
     }
 
     fn emit_color_subblock(&mut self, quad_x: usize, quad_y: usize) {
-        idct_2d(self.rle.coeffs(), &self.scale_table, &mut self.y_block);
+        Self::run_idct_to(
+            self.is_default_scale,
+            &self.scale_table,
+            &self.rle,
+            &mut self.y_block,
+        );
         match self.output_depth {
             HardwareDepth::Bit15 => {
                 let mut pixels = [0u16; 64];
@@ -603,10 +668,11 @@ impl MdecDevice {
                     self.set_bit15,
                     &mut pixels,
                 );
-                for pair in pixels.chunks_exact(2) {
-                    let w = u32::from(pair[0]) | (u32::from(pair[1]) << 16);
-                    self.out_fifo.push(w);
+                let mut words = [0u32; 32];
+                for (dst, pair) in words.iter_mut().zip(pixels.chunks_exact(2)) {
+                    *dst = u32::from(pair[0]) | (u32::from(pair[1]) << 16);
                 }
+                self.out_fifo.push_slice(&words);
             }
             HardwareDepth::Bit24 => {
                 let mut bytes = [0u8; 192];
@@ -619,10 +685,11 @@ impl MdecDevice {
                     self.output_signed,
                     &mut bytes,
                 );
-                for chunk in bytes.chunks_exact(4) {
-                    let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    self.out_fifo.push(w);
+                let mut words = [0u32; 48];
+                for (dst, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+                    *dst = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 }
+                self.out_fifo.push_slice(&words);
             }
             HardwareDepth::Bit4 | HardwareDepth::Bit8 => {}
         }
