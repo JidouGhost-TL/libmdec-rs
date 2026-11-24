@@ -9,4 +9,9 @@ description = "Standalone pure-Rust PlayStation 1 MDEC hardware video decoder an
 keywords = ["ps1", "psx", "playstation", "mdec", "video"]
 categories = ["multimedia::video", "emulators"]
 
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
 [dependencies]

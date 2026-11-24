@@ -4,19 +4,23 @@
 //! - [`BitReader`]: MSB-first reader over PS1 little-endian 16-bit halfword streams
 //! - [`AcCodebook`]: validated, prefix-free AC run/level Huffman codebook
 //! - [`DcCoding`]: fixed-length 10-bit DC (BS v1/v2) and predicted VLC DC (BS v3)
-//! - [`vlc_to_rle`] and [`vlc_to_rle_with_block_headers`]
+//! - [`vlc_to_rle`], [`vlc_to_rle_with_block_headers`], and [`vlc_ac_to_rle_with_headers`]
 //! - [`vlc0_bitcodes`]: returns the 224 standard Sony `VLC0` bitcodes in table order
 
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+
+#[cfg(feature = "alloc")]
 use crate::rle::EOB_HALFWORD;
-use crate::tables::{
-    dc_table, Component, AC_EOB_CODE, AC_EOB_LEN, AC_ESCAPE_CODE, AC_ESCAPE_LEN,
-    STANDARD_AC_ENTRIES,
-};
+#[cfg(feature = "alloc")]
+use crate::tables::{Component, DcCode, DC_CHROMA, DC_LUMA};
+use crate::tables::{AC_EOB_CODE, AC_EOB_LEN, AC_ESCAPE_CODE, AC_ESCAPE_LEN, STANDARD_AC_ENTRIES};
 use crate::Error;
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
 /// MSB-first bit reader over a PS1 BS bitstream stored as little-endian 16-bit halfwords.
+///
+/// Valid bits are kept MSB-aligned at the top of `buf` (bits `63` down to
+/// `64 - bits_in_buf`), with all lower bits guaranteed to be zero.
 #[derive(Debug, Clone)]
 pub struct BitReader<'a> {
     data: &'a [u8],
@@ -27,6 +31,7 @@ pub struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     /// Creates a new [`BitReader`] over `data`.
+    #[must_use]
     pub const fn new(data: &'a [u8]) -> Self {
         Self {
             data,
@@ -37,18 +42,20 @@ impl<'a> BitReader<'a> {
     }
 
     /// Returns the total number of unread bits remaining in the stream.
+    #[must_use]
     pub fn bits_remaining(&self) -> usize {
         let remaining_halfwords = (self.data.len().saturating_sub(self.byte_pos)) / 2;
         self.bits_in_buf as usize + remaining_halfwords * 16
     }
 
-    /// Ensures the internal bit buffer holds at least `n` bits (up to 32) if
-    /// enough halfwords remain in `self.data`.
-    fn refill(&mut self, n: u32) {
-        while self.bits_in_buf < n && self.byte_pos + 1 < self.data.len() {
+    /// Refills the internal MSB-aligned `u64` buffer with as many 16-bit
+    /// halfwords as fit (up to 64 bits).
+    #[inline]
+    fn refill(&mut self) {
+        while self.bits_in_buf <= 48 && self.byte_pos + 1 < self.data.len() {
             let hw = u16::from_le_bytes([self.data[self.byte_pos], self.data[self.byte_pos + 1]]);
             self.byte_pos += 2;
-            self.buf = (self.buf << 16) | u64::from(hw);
+            self.buf |= u64::from(hw) << (48 - self.bits_in_buf);
             self.bits_in_buf += 16;
         }
     }
@@ -57,32 +64,25 @@ impl<'a> BitReader<'a> {
     ///
     /// Returns `(bits, count)` where `count <= n` is the actual number of bits
     /// available and `bits` is right-aligned to `count` bits.
+    #[must_use]
     pub fn peek_upto(&mut self, n: u32) -> (u32, u32) {
         debug_assert!((1..=32).contains(&n));
-        self.refill(n);
+        if self.bits_in_buf < n {
+            self.refill();
+        }
         let avail = self.bits_in_buf.min(n);
         if avail == 0 {
             return (0, 0);
         }
-        let shift = self.bits_in_buf - avail;
-        let mask = if avail == 32 {
-            u32::MAX
-        } else {
-            (1u32 << avail) - 1
-        };
-        (((self.buf >> shift) as u32) & mask, avail)
+        ((self.buf >> (64 - avail)) as u32, avail)
     }
 
     /// Consumes `n` bits that were previously peeked.
     #[inline]
     pub fn consume(&mut self, n: u32) {
         debug_assert!(n <= self.bits_in_buf);
+        self.buf = self.buf.checked_shl(n).unwrap_or(0);
         self.bits_in_buf -= n;
-        if self.bits_in_buf == 0 {
-            self.buf = 0;
-        } else {
-            self.buf &= (1u64 << self.bits_in_buf) - 1;
-        }
     }
 
     /// If the next `len` bits equal `code`, consumes them and returns `true`.
@@ -97,31 +97,39 @@ impl<'a> BitReader<'a> {
     }
 
     /// Reads `n` (`1..=32`) unsigned bits MSB-first.
+    #[inline]
     pub fn read(&mut self, n: u32) -> Result<u32, Error> {
         if !(1..=32).contains(&n) {
             return Err(Error::InvalidParameter("bit count out of range 1..=32"));
         }
-        let (bits, got) = self.peek_upto(n);
-        if got < n {
-            return Err(Error::UnexpectedEof);
+        if self.bits_in_buf < n {
+            self.refill();
+            if self.bits_in_buf < n {
+                return Err(Error::UnexpectedEof);
+            }
         }
-        self.consume(n);
+        let bits = (self.buf >> (64 - n)) as u32;
+        self.buf <<= n;
+        self.bits_in_buf -= n;
         Ok(bits)
     }
 
     /// Reads `n` (`1..=32`) two's-complement signed bits MSB-first.
+    #[inline]
     pub fn read_signed(&mut self, n: u32) -> Result<i32, Error> {
-        let raw = self.read(n)?;
-        if n == 32 {
-            return Ok(raw as i32);
+        if !(1..=32).contains(&n) {
+            return Err(Error::InvalidParameter("bit count out of range 1..=32"));
         }
-        let sign_bit = 1u32 << (n - 1);
-        if (raw & sign_bit) != 0 {
-            let ext = raw | !((1u32 << n) - 1);
-            Ok(ext as i32)
-        } else {
-            Ok(raw as i32)
+        if self.bits_in_buf < n {
+            self.refill();
+            if self.bits_in_buf < n {
+                return Err(Error::UnexpectedEof);
+            }
         }
+        let val = ((self.buf as i64) >> (64 - n)) as i32;
+        self.buf <<= n;
+        self.bits_in_buf -= n;
+        Ok(val)
     }
 }
 
@@ -176,16 +184,103 @@ pub enum AcEvent {
     },
 }
 
-/// Validated, prefix-free AC run/level variable-length codebook.
-#[derive(Debug, Clone)]
-pub struct AcCodebook {
-    eob_code: u32,
-    eob_len: u32,
-    escape: Option<AcEscape>,
-    lengths: Vec<u32>,
-    map: HashMap<(u32, u32), (u32, i32)>,
+// --- Compact 9-bit primary LUT + flat secondary trie encoding ---
+//
+// Each 32-bit slot in `primary: [u32; 512]` and `TrieNode::child: [u32; 2]`
+// uses the top 3 bits as a tag:
+// - `0`: invalid / unassigned (`entry == 0`)
+// - `1`: EOB; bits 4..0 = code length (1..=9 for primary, 0 for trie leaf)
+// - `2`: Escape; bits 4..0 = code length (1..=9 for primary, 0 for trie leaf)
+// - `3`: Inline RunLevel; bits 28..24 = len, bits 23..16 = run (0..=255),
+//        bits 15..0 = level as i16 (-32768..=32767)
+// - `4`: Secondary trie branch; bits 28..0 = node index in `trie`
+// - `5`: Out-of-range RunLevel (custom codebooks only); bits 28..24 = len,
+//        bits 23..0 = index in `extra`
+
+const PRIMARY_BITS: u32 = 9;
+const PRIMARY_SIZE: usize = 1 << PRIMARY_BITS;
+
+const TAG_SHIFT: u32 = 29;
+const TAG_INVALID: u32 = 0;
+const TAG_EOB: u32 = 1;
+const TAG_ESCAPE: u32 = 2;
+const TAG_INLINE: u32 = 3;
+const TAG_BRANCH: u32 = 4;
+#[cfg(feature = "alloc")]
+const TAG_EXTRA: u32 = 5;
+
+const PAYLOAD_MASK: u32 = (1 << TAG_SHIFT) - 1;
+
+#[inline]
+const fn pack_eob(len: u32) -> u32 {
+    (TAG_EOB << TAG_SHIFT) | (len & 0x1F)
 }
 
+#[inline]
+const fn pack_escape(len: u32) -> u32 {
+    (TAG_ESCAPE << TAG_SHIFT) | (len & 0x1F)
+}
+
+#[inline]
+const fn pack_inline(len: u32, run: u32, level: i16) -> u32 {
+    (TAG_INLINE << TAG_SHIFT)
+        | ((len & 0x1F) << 24)
+        | ((run & 0xFF) << 16)
+        | ((level as u16) as u32)
+}
+
+#[inline]
+const fn pack_branch(node_idx: usize) -> u32 {
+    (TAG_BRANCH << TAG_SHIFT) | ((node_idx as u32) & PAYLOAD_MASK)
+}
+
+#[cfg(feature = "alloc")]
+#[inline]
+const fn pack_extra(len: u32, extra_idx: usize) -> u32 {
+    (TAG_EXTRA << TAG_SHIFT) | ((len & 0x1F) << 24) | ((extra_idx as u32) & 0x00FF_FFFF)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrieNode {
+    child: [u32; 2],
+}
+
+impl TrieNode {
+    const EMPTY: Self = Self { child: [0, 0] };
+}
+
+#[derive(Debug, Clone)]
+enum SecondaryTrie {
+    Static(&'static [TrieNode]),
+    #[cfg(feature = "alloc")]
+    Owned(Vec<TrieNode>),
+}
+
+impl SecondaryTrie {
+    #[inline]
+    fn as_slice(&self) -> &[TrieNode] {
+        match self {
+            Self::Static(s) => s,
+            #[cfg(feature = "alloc")]
+            Self::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
+/// Validated, prefix-free AC run/level variable-length codebook.
+///
+/// Uses a 2 KiB 9-bit primary flat lookup table backed by a compact flat binary
+/// trie for codes longer than 9 bits (zero hashing on the decode hot path).
+#[derive(Debug, Clone)]
+pub struct AcCodebook {
+    primary: [u32; PRIMARY_SIZE],
+    trie: SecondaryTrie,
+    escape: Option<AcEscape>,
+    #[cfg(feature = "alloc")]
+    extra: Vec<(u32, i32)>,
+}
+
+#[cfg(feature = "alloc")]
 fn check_code_bits(code: u32, len: u32) -> Result<(), Error> {
     if !(1..=32).contains(&len) {
         return Err(Error::InvalidCodebook("code length must be in 1..=32"));
@@ -208,42 +303,132 @@ const fn parse_bits(s: &str) -> (u32, u32) {
     (code, bytes.len() as u32)
 }
 
+// Compile-time construction of the standard PS1 MDEC AC codebook (224 codes).
+const STANDARD_TRIE_CAPACITY: usize = 256;
+
+const fn build_standard_tables() -> (
+    [u32; PRIMARY_SIZE],
+    [TrieNode; STANDARD_TRIE_CAPACITY],
+    usize,
+) {
+    let mut primary = [0u32; PRIMARY_SIZE];
+    let mut trie = [TrieNode::EMPTY; STANDARD_TRIE_CAPACITY];
+    let mut trie_len: usize = 0;
+
+    // Insert EOB (`10`, len 2) into primary LUT.
+    {
+        let shift = PRIMARY_BITS - AC_EOB_LEN;
+        let base = (AC_EOB_CODE << shift) as usize;
+        let count = 1usize << shift;
+        let val = pack_eob(AC_EOB_LEN);
+        let mut j = 0;
+        while j < count {
+            primary[base + j] = val;
+            j += 1;
+        }
+    }
+
+    // Insert Escape (`000001`, len 6) into primary LUT.
+    {
+        let shift = PRIMARY_BITS - AC_ESCAPE_LEN;
+        let base = (AC_ESCAPE_CODE << shift) as usize;
+        let count = 1usize << shift;
+        let val = pack_escape(AC_ESCAPE_LEN);
+        let mut j = 0;
+        while j < count {
+            primary[base + j] = val;
+            j += 1;
+        }
+    }
+
+    // Insert all 222 standard AC entries.
+    let mut i = 0;
+    while i < STANDARD_AC_ENTRIES.len() {
+        let (bits, run, level) = STANDARD_AC_ENTRIES[i];
+        let (code, len) = parse_bits(bits);
+        if len <= PRIMARY_BITS {
+            let shift = PRIMARY_BITS - len;
+            let base = (code << shift) as usize;
+            let count = 1usize << shift;
+            let val = pack_inline(len, run, level as i16);
+            let mut j = 0;
+            while j < count {
+                primary[base + j] = val;
+                j += 1;
+            }
+        } else {
+            let top9 = (code >> (len - PRIMARY_BITS)) as usize;
+            let mut node_idx = if primary[top9] == 0 {
+                let idx = trie_len;
+                trie_len += 1;
+                primary[top9] = pack_branch(idx);
+                idx
+            } else {
+                (primary[top9] & PAYLOAD_MASK) as usize
+            };
+
+            let mut bit_pos = len - PRIMARY_BITS - 1;
+            loop {
+                let bit = ((code >> bit_pos) & 1) as usize;
+                if bit_pos == 0 {
+                    trie[node_idx].child[bit] = pack_inline(0, run, level as i16);
+                    break;
+                }
+                let child = trie[node_idx].child[bit];
+                if child == 0 {
+                    let idx = trie_len;
+                    trie_len += 1;
+                    trie[node_idx].child[bit] = pack_branch(idx);
+                    node_idx = idx;
+                } else {
+                    node_idx = (child & PAYLOAD_MASK) as usize;
+                }
+                bit_pos -= 1;
+            }
+        }
+        i += 1;
+    }
+
+    (primary, trie, trie_len)
+}
+
+const STANDARD_RAW: (
+    [u32; PRIMARY_SIZE],
+    [TrieNode; STANDARD_TRIE_CAPACITY],
+    usize,
+) = build_standard_tables();
+
+static STANDARD_AC_CODEBOOK: AcCodebook = AcCodebook {
+    primary: STANDARD_RAW.0,
+    trie: SecondaryTrie::Static(&STANDARD_RAW.1),
+    escape: Some(AcEscape::STANDARD),
+    #[cfg(feature = "alloc")]
+    extra: Vec::new(),
+};
+
 impl AcCodebook {
-    /// Returns the standard PS1 MDEC AC codebook (built once and cached globally).
+    /// Returns the standard PS1 MDEC AC codebook (precomputed at compile time,
+    /// zero runtime allocation and `#![no_std]`-compatible).
+    #[must_use]
+    #[inline]
     pub fn standard() -> &'static Self {
-        static STANDARD: OnceLock<AcCodebook> = OnceLock::new();
-        STANDARD.get_or_init(|| {
-            let entries: Vec<AcCodeEntry> = STANDARD_AC_ENTRIES
-                .iter()
-                .map(|&(bits, run, level)| {
-                    let (code, len) = parse_bits(bits);
-                    AcCodeEntry {
-                        code,
-                        len,
-                        run,
-                        level,
-                    }
-                })
-                .collect();
-            Self::try_new(
-                (AC_EOB_CODE, AC_EOB_LEN),
-                Some(AcEscape::STANDARD),
-                &entries,
-            )
-            .expect("built-in standard PS1 MDEC AC codebook is valid and prefix-free")
-        })
+        &STANDARD_AC_CODEBOOK
     }
 
     /// Constructs a custom AC codebook, validating bit widths, uniqueness, and
     /// prefix-freeness across `eob`, `escape`, and `entries`.
+    #[cfg(feature = "alloc")]
     pub fn try_new(
         eob: (u32, u32),
         escape: Option<AcEscape>,
         entries: &[AcCodeEntry],
     ) -> Result<Self, Error> {
         check_code_bits(eob.0, eob.1)?;
-        let mut all_codes: Vec<(u32, u32)> = Vec::with_capacity(entries.len() + 2);
-        all_codes.push((eob.1, eob.0));
+
+        // Collect (len, code, leaf_value_without_len) so we can insert shortest-first
+        // and detect every duplicate or prefix collision in a single pass.
+        let mut items: Vec<(u32, u32, u32)> = Vec::with_capacity(entries.len() + 2);
+        items.push((eob.1, eob.0, pack_eob(0)));
 
         if let Some(esc) = escape {
             check_code_bits(esc.code, esc.len)?;
@@ -252,72 +437,216 @@ impl AcCodebook {
                     "escape run/level bit widths must be in 1..=32",
                 ));
             }
-            all_codes.push((esc.len, esc.code));
+            items.push((esc.len, esc.code, pack_escape(0)));
         }
 
-        let mut map = HashMap::with_capacity(entries.len());
-        let mut length_set: Vec<u32> = Vec::new();
+        let mut extra: Vec<(u32, i32)> = Vec::new();
         for entry in entries {
             check_code_bits(entry.code, entry.len)?;
-            if map
-                .insert((entry.len, entry.code), (entry.run, entry.level))
-                .is_some()
+            let leaf = if entry.run <= u32::from(u8::MAX)
+                && (i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&entry.level)
             {
-                return Err(Error::InvalidCodebook("duplicate AC codebook entry"));
-            }
-            if !length_set.contains(&entry.len) {
-                length_set.push(entry.len);
-            }
-            all_codes.push((entry.len, entry.code));
+                pack_inline(0, entry.run, entry.level as i16)
+            } else {
+                let idx = extra.len();
+                if idx > 0x00FF_FFFF {
+                    return Err(Error::InvalidCodebook("too many extended codebook entries"));
+                }
+                extra.push((entry.run, entry.level));
+                pack_extra(0, idx)
+            };
+            items.push((entry.len, entry.code, leaf));
         }
 
-        // Verify prefix-freeness across EOB, escape, and all entries.
-        all_codes.sort_unstable();
-        let mut seen: HashSet<(u32, u32)> = HashSet::with_capacity(all_codes.len());
-        for &(len, code) in &all_codes {
-            for prefix_len in 1..=len {
-                let prefix = code >> (len - prefix_len);
-                if seen.contains(&(prefix_len, prefix)) {
-                    return Err(Error::InvalidCodebook(
-                        "AC codebook is not prefix-free (duplicate or prefix collision)",
-                    ));
+        items.sort_unstable_by_key(|&(len, code, _)| (len, code));
+
+        let mut primary = [0u32; PRIMARY_SIZE];
+        let mut trie: Vec<TrieNode> = Vec::new();
+
+        for (len, code, leaf) in items {
+            if len <= PRIMARY_BITS {
+                let primary_val = match leaf >> TAG_SHIFT {
+                    TAG_EOB => pack_eob(len),
+                    TAG_ESCAPE => pack_escape(len),
+                    TAG_INLINE | TAG_EXTRA => leaf | ((len & 0x1F) << 24),
+                    _ => unreachable!(),
+                };
+                let shift = PRIMARY_BITS - len;
+                let base = (code << shift) as usize;
+                let count = 1usize << shift;
+                for slot in &mut primary[base..base + count] {
+                    if *slot != 0 {
+                        return Err(Error::InvalidCodebook(
+                            "AC codebook is not prefix-free (duplicate or prefix collision)",
+                        ));
+                    }
+                    *slot = primary_val;
+                }
+            } else {
+                let top9 = (code >> (len - PRIMARY_BITS)) as usize;
+                let mut node_idx = match primary[top9] >> TAG_SHIFT {
+                    TAG_INVALID => {
+                        let idx = trie.len();
+                        trie.push(TrieNode::EMPTY);
+                        primary[top9] = pack_branch(idx);
+                        idx
+                    }
+                    TAG_BRANCH => (primary[top9] & PAYLOAD_MASK) as usize,
+                    _ => {
+                        return Err(Error::InvalidCodebook(
+                            "AC codebook is not prefix-free (duplicate or prefix collision)",
+                        ));
+                    }
+                };
+
+                let mut bit_pos = len - PRIMARY_BITS - 1;
+                loop {
+                    let bit = ((code >> bit_pos) & 1) as usize;
+                    if bit_pos == 0 {
+                        if trie[node_idx].child[bit] != 0 {
+                            return Err(Error::InvalidCodebook(
+                                "AC codebook is not prefix-free (duplicate or prefix collision)",
+                            ));
+                        }
+                        trie[node_idx].child[bit] = leaf;
+                        break;
+                    }
+                    let child = trie[node_idx].child[bit];
+                    match child >> TAG_SHIFT {
+                        TAG_INVALID => {
+                            let idx = trie.len();
+                            trie.push(TrieNode::EMPTY);
+                            trie[node_idx].child[bit] = pack_branch(idx);
+                            node_idx = idx;
+                        }
+                        TAG_BRANCH => {
+                            node_idx = (child & PAYLOAD_MASK) as usize;
+                        }
+                        _ => {
+                            return Err(Error::InvalidCodebook(
+                                "AC codebook is not prefix-free (duplicate or prefix collision)",
+                            ));
+                        }
+                    }
+                    bit_pos -= 1;
                 }
             }
-            seen.insert((len, code));
         }
 
-        length_set.sort_unstable();
         Ok(Self {
-            eob_code: eob.0,
-            eob_len: eob.1,
+            primary,
+            trie: SecondaryTrie::Owned(trie),
             escape,
-            lengths: length_set,
-            map,
+            extra,
         })
     }
 
-    /// Decodes the next AC event from `br`, resolving escapes to `RunLevel`.
-    pub fn decode(&self, br: &mut BitReader<'_>) -> Result<AcEvent, Error> {
-        if br.try_match(self.eob_code, self.eob_len) {
-            return Ok(AcEvent::Eob);
-        }
-        if let Some(esc) = self.escape {
-            if br.try_match(esc.code, esc.len) {
-                let run = br.read(esc.run_bits)?;
-                let level = br.read_signed(esc.level_bits)?;
-                return Ok(AcEvent::RunLevel { run, level });
-            }
-        }
-        for &len in &self.lengths {
-            let (bits, got) = br.peek_upto(len);
-            if got == len {
-                if let Some(&(run, level)) = self.map.get(&(len, bits)) {
-                    br.consume(len);
-                    return Ok(AcEvent::RunLevel { run, level });
+    #[inline]
+    fn decode_escape(&self, br: &mut BitReader<'_>) -> Result<AcEvent, Error> {
+        let esc = self.escape.ok_or(Error::BitstreamDesync)?;
+        let run = br.read(esc.run_bits)?;
+        let level = br.read_signed(esc.level_bits)?;
+        Ok(AcEvent::RunLevel { run, level })
+    }
+
+    #[inline(never)]
+    fn decode_trie(&self, br: &mut BitReader<'_>, mut node_idx: usize) -> Result<AcEvent, Error> {
+        let nodes = self.trie.as_slice();
+        loop {
+            if br.bits_in_buf == 0 {
+                br.refill();
+                if br.bits_in_buf == 0 {
+                    return Err(Error::BitstreamDesync);
                 }
             }
+            let bit = (br.buf >> 63) as usize;
+            br.buf <<= 1;
+            br.bits_in_buf -= 1;
+
+            let entry = nodes[node_idx].child[bit];
+            match entry >> TAG_SHIFT {
+                TAG_INVALID => return Err(Error::BitstreamDesync),
+                TAG_EOB => return Ok(AcEvent::Eob),
+                TAG_ESCAPE => return self.decode_escape(br),
+                TAG_INLINE => {
+                    let run = (entry >> 16) & 0xFF;
+                    let level = i32::from((entry & 0xFFFF) as i16);
+                    return Ok(AcEvent::RunLevel { run, level });
+                }
+                #[cfg(feature = "alloc")]
+                TAG_EXTRA => {
+                    let idx = (entry & 0x00FF_FFFF) as usize;
+                    let (run, level) = self.extra[idx];
+                    return Ok(AcEvent::RunLevel { run, level });
+                }
+                TAG_BRANCH => {
+                    node_idx = (entry & PAYLOAD_MASK) as usize;
+                }
+                _ => return Err(Error::BitstreamDesync),
+            }
         }
-        Err(Error::BitstreamDesync)
+    }
+
+    /// Decodes the next AC event from `br`, resolving escapes to `RunLevel`.
+    #[inline]
+    pub fn decode(&self, br: &mut BitReader<'_>) -> Result<AcEvent, Error> {
+        if br.bits_in_buf < PRIMARY_BITS {
+            br.refill();
+            if br.bits_in_buf == 0 {
+                return Err(Error::BitstreamDesync);
+            }
+        }
+
+        let idx = (br.buf >> (64 - PRIMARY_BITS)) as usize;
+        let entry = self.primary[idx];
+        match entry >> TAG_SHIFT {
+            TAG_INVALID => Err(Error::BitstreamDesync),
+            TAG_EOB => {
+                let len = entry & 0x1F;
+                if br.bits_in_buf < len {
+                    return Err(Error::BitstreamDesync);
+                }
+                br.consume(len);
+                Ok(AcEvent::Eob)
+            }
+            TAG_ESCAPE => {
+                let len = entry & 0x1F;
+                if br.bits_in_buf < len {
+                    return Err(Error::BitstreamDesync);
+                }
+                br.consume(len);
+                self.decode_escape(br)
+            }
+            TAG_INLINE => {
+                let len = (entry >> 24) & 0x1F;
+                if br.bits_in_buf < len {
+                    return Err(Error::BitstreamDesync);
+                }
+                br.consume(len);
+                let run = (entry >> 16) & 0xFF;
+                let level = i32::from((entry & 0xFFFF) as i16);
+                Ok(AcEvent::RunLevel { run, level })
+            }
+            #[cfg(feature = "alloc")]
+            TAG_EXTRA => {
+                let len = (entry >> 24) & 0x1F;
+                if br.bits_in_buf < len {
+                    return Err(Error::BitstreamDesync);
+                }
+                br.consume(len);
+                let extra_idx = (entry & 0x00FF_FFFF) as usize;
+                let (run, level) = self.extra[extra_idx];
+                Ok(AcEvent::RunLevel { run, level })
+            }
+            TAG_BRANCH => {
+                if br.bits_in_buf < PRIMARY_BITS {
+                    return Err(Error::BitstreamDesync);
+                }
+                br.consume(PRIMARY_BITS);
+                self.decode_trie(br, (entry & PAYLOAD_MASK) as usize)
+            }
+            _ => Err(Error::BitstreamDesync),
+        }
     }
 }
 
@@ -326,6 +655,7 @@ impl AcCodebook {
 /// - indices `1..=22`: 3-to-7-bit run/level codes
 /// - index `23`: 6-bit escape prefix (`000001`)
 /// - indices `24..=223`: 8-to-17-bit run/level codes
+#[must_use]
 pub fn vlc0_bitcodes() -> [(u32, u32); 224] {
     let mut out = [(0u32, 0u32); 224];
     out[0] = (AC_EOB_CODE, AC_EOB_LEN);
@@ -348,28 +678,74 @@ pub enum DcCoding {
     PredictedVlc,
 }
 
-/// Decodes a BS v3 differential DC value using the component's Huffman table.
+/// Builds a 256-entry 8-bit lookup table for a BS v3 DC-difference Huffman table.
+///
+/// Each byte encodes `(len << 4) | width` (or `0` for invalid prefixes).
+#[cfg(feature = "alloc")]
+const fn build_dc_lut(table: &[DcCode; 9]) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    let mut i = 0;
+    while i < table.len() {
+        let entry = table[i];
+        let shift = 8 - entry.len;
+        let base = (entry.code << shift) as usize;
+        let count = 1usize << shift;
+        let packed = ((entry.len as u8) << 4) | (entry.width as u8);
+        let mut j = 0;
+        while j < count {
+            lut[base + j] = packed;
+            j += 1;
+        }
+        i += 1;
+    }
+    lut
+}
+
+#[cfg(feature = "alloc")]
+const DC_LUMA_LUT: [u8; 256] = build_dc_lut(&DC_LUMA);
+#[cfg(feature = "alloc")]
+const DC_CHROMA_LUT: [u8; 256] = build_dc_lut(&DC_CHROMA);
+
+/// Decodes a BS v3 differential DC value using a 256-entry lookup table.
+#[cfg(feature = "alloc")]
+#[inline]
 fn decode_dc_diff(br: &mut BitReader<'_>, component: Component) -> Result<i32, Error> {
-    let table = dc_table(component);
-    for entry in table {
-        if br.try_match(entry.code, entry.len) {
-            if entry.width == 0 {
-                return Ok(0);
-            }
-            let raw = br.read(entry.width)?;
-            let half = 1u32 << (entry.width - 1);
-            let diff = if raw < half {
-                raw as i32 - ((1i32 << entry.width) - 1)
-            } else {
-                raw as i32
-            };
-            return Ok(diff);
+    let lut = match component {
+        Component::Luma => &DC_LUMA_LUT,
+        Component::Chroma => &DC_CHROMA_LUT,
+    };
+    if br.bits_in_buf < 8 {
+        br.refill();
+        if br.bits_in_buf == 0 {
+            return Err(Error::BitstreamDesync);
         }
     }
-    Err(Error::BitstreamDesync)
+    let packed = lut[(br.buf >> 56) as usize];
+    if packed == 0 {
+        return Err(Error::BitstreamDesync);
+    }
+    let len = u32::from(packed >> 4);
+    if br.bits_in_buf < len {
+        return Err(Error::BitstreamDesync);
+    }
+    br.consume(len);
+
+    let width = u32::from(packed & 0x0F);
+    if width == 0 {
+        return Ok(0);
+    }
+    let raw = br.read(width)?;
+    let half = 1u32 << (width - 1);
+    let diff = if raw < half {
+        raw as i32 - ((1i32 << width) - 1)
+    } else {
+        raw as i32
+    };
+    Ok(diff)
 }
 
 /// Packs `(top6, signed10)` into a hardware MDEC 16-bit RLE halfword.
+#[cfg(feature = "alloc")]
 #[inline]
 const fn pack_rle_halfword(top6: u16, val10: i32) -> u16 {
     ((top6 & 0x3F) << 10) | ((val10 as u16) & 0x3FF)
@@ -380,6 +756,7 @@ const fn pack_rle_halfword(top6: u16, val10: i32) -> u16 {
 /// Decodes `macroblocks` 16×16 macroblocks (`6` blocks per macroblock:
 /// `Cr, Cb, Y0, Y1, Y2, Y3`) using frame-level `q_scale` (`0..=63`) and
 /// appends the resulting RLE halfwords to `out`.
+#[cfg(feature = "alloc")]
 pub fn vlc_to_rle(
     bitstream: &[u8],
     q_scale: u16,
@@ -408,18 +785,20 @@ pub fn vlc_to_rle(
             let dc = match dc_coding {
                 DcCoding::FixedLength => br.read_signed(10)?,
                 DcCoding::PredictedVlc => {
-                    let diff = decode_dc_diff(&mut br, component)?;
+                    // BS v3 DC diffs are in spatial units; pre-qt[0] RLE DC
+                    // scales by 4 so `diff * 4 * qt[0](2) / 8 == diff`.
+                    let delta = decode_dc_diff(&mut br, component)? * 4;
                     let pred = match block_idx {
                         0 => {
-                            pred_cr += diff;
+                            pred_cr += delta;
                             pred_cr
                         }
                         1 => {
-                            pred_cb += diff;
+                            pred_cb += delta;
                             pred_cb
                         }
                         _ => {
-                            pred_y += diff;
+                            pred_y += delta;
                             pred_y
                         }
                     };
@@ -438,6 +817,7 @@ pub fn vlc_to_rle(
 /// Decodes a PS1 BS VLC bitstream where every block begins with a 16-bit
 /// `(q_scale: 6 bits, dc: 10 signed bits)` header into hardware MDEC 16-bit
 /// RLE halfwords.
+#[cfg(feature = "alloc")]
 pub fn vlc_to_rle_with_block_headers(
     bitstream: &[u8],
     codebook: &AcCodebook,
@@ -458,6 +838,33 @@ pub fn vlc_to_rle_with_block_headers(
     Ok(())
 }
 
+/// Decodes an AC-only PS1 BS bitstream paired with out-of-band `(q_scale, dc)`
+/// per-block headers (such as `Iki` frames) into hardware MDEC 16-bit RLE halfwords.
+///
+/// Each `(q_scale, dc)` entry supplies the 6-bit quantization scale (`0..=63`)
+/// and 10-bit signed DC value for one 8×8 block, followed by AC run/level
+/// symbols decoded from `ac_bitstream` using `codebook`.
+#[cfg(feature = "alloc")]
+pub fn vlc_ac_to_rle_with_headers(
+    ac_bitstream: &[u8],
+    block_headers: &[(u16, i32)],
+    codebook: &AcCodebook,
+    out: &mut Vec<u16>,
+) -> Result<(), Error> {
+    let mut br = BitReader::new(ac_bitstream);
+
+    for &(q_scale, dc) in block_headers {
+        if q_scale > 63 {
+            return Err(Error::InvalidParameter("q_scale must be in 0..=63"));
+        }
+        out.push(pack_rle_halfword(q_scale, dc.clamp(-512, 511)));
+        decode_ac_block(&mut br, codebook, out)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "alloc")]
 fn decode_ac_block(
     br: &mut BitReader<'_>,
     codebook: &AcCodebook,
@@ -482,9 +889,10 @@ fn decode_ac_block(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
+    use alloc::string::String;
 
     fn pack_bits(bits: &str) -> Vec<u8> {
         let mut out = Vec::new();
@@ -534,6 +942,48 @@ mod tests {
     }
 
     #[test]
+    fn standard_codebook_matches_dynamic_try_new_for_all_224_codes() {
+        let entries: Vec<AcCodeEntry> = STANDARD_AC_ENTRIES
+            .iter()
+            .map(|&(bits, run, level)| {
+                let (code, len) = parse_bits(bits);
+                AcCodeEntry {
+                    code,
+                    len,
+                    run,
+                    level,
+                }
+            })
+            .collect();
+        let dyn_cb = AcCodebook::try_new(
+            (AC_EOB_CODE, AC_EOB_LEN),
+            Some(AcEscape::STANDARD),
+            &entries,
+        )
+        .unwrap();
+        let std_cb = AcCodebook::standard();
+
+        for &(bits, run, level) in &STANDARD_AC_ENTRIES {
+            let mut stream = String::from(bits);
+            stream.push_str("10");
+            let data = pack_bits(&stream);
+
+            let mut br_std = BitReader::new(&data);
+            let mut br_dyn = BitReader::new(&data);
+            assert_eq!(
+                std_cb.decode(&mut br_std).unwrap(),
+                AcEvent::RunLevel { run, level }
+            );
+            assert_eq!(
+                dyn_cb.decode(&mut br_dyn).unwrap(),
+                AcEvent::RunLevel { run, level }
+            );
+            assert_eq!(std_cb.decode(&mut br_std).unwrap(), AcEvent::Eob);
+            assert_eq!(dyn_cb.decode(&mut br_dyn).unwrap(), AcEvent::Eob);
+        }
+    }
+
+    #[test]
     fn custom_codebook_rejects_prefix_collision() {
         let res = AcCodebook::try_new(
             (0b0, 1),
@@ -573,9 +1023,11 @@ mod tests {
             assert_eq!(pair[1], EOB_HALFWORD);
         }
 
-        // PredictedVlc: Cr diff=0 ("00"), Cb diff=0 ("00"), Y0 diff=+1 ("00" width=1, "1"),
-        // Y1..Y3 diff=0 ("100"), each followed by EOB ("10").
-        let bits_v3 = "00 10  00 10  00 1 10  100 10  100 10  100 10";
+        // PredictedVlc (BS v3): diffs are scaled by 4 in the pre-qt[0] RLE DC domain.
+        // Cr diff=0 ("00"), Cb diff=-1 ("01" width=1, "0"),
+        // Y0 diff=+1 ("00" width=1, "1"), Y1 diff=0 ("100"),
+        // Y2 diff=+2 ("01" width=2, "10"), Y3 diff=0 ("100"), each followed by EOB ("10").
+        let bits_v3 = "00 10  01 0 10  00 1 10  100 10  01 10 10  100 10";
         let data_v3 = pack_bits(bits_v3);
         let mut rle_v3 = Vec::new();
         vlc_to_rle(
@@ -587,11 +1039,37 @@ mod tests {
             &mut rle_v3,
         )
         .unwrap();
-        assert_eq!(rle_v3[0], 2 << 10); // Cr DC=0
-        assert_eq!(rle_v3[2], 2 << 10); // Cb DC=0
-        assert_eq!(rle_v3[4], (2 << 10) | 1); // Y0 DC=+1
-        assert_eq!(rle_v3[6], (2 << 10) | 1); // Y1 DC=+1 (predicted)
-        assert_eq!(rle_v3[8], (2 << 10) | 1); // Y2 DC=+1
-        assert_eq!(rle_v3[10], (2 << 10) | 1); // Y3 DC=+1
+        assert_eq!(rle_v3[0], 2 << 10); // Cr DC = 0
+        assert_eq!(rle_v3[2], (2 << 10) | ((-4i32 as u16) & 0x3FF)); // Cb DC = -1 * 4 = -4
+        assert_eq!(rle_v3[4], (2 << 10) | 4); // Y0 DC = +1 * 4 = +4
+        assert_eq!(rle_v3[6], (2 << 10) | 4); // Y1 DC = +4 (predicted)
+        assert_eq!(rle_v3[8], (2 << 10) | 12); // Y2 DC = +4 + 2*4 = +12
+        assert_eq!(rle_v3[10], (2 << 10) | 12); // Y3 DC = +12 (predicted)
+    }
+
+    #[test]
+    fn vlc_ac_to_rle_with_headers_decodes_out_of_band_headers() {
+        // Block 0: AC (0, 1) -> "110", EOB -> "10"
+        // Block 1: immediate EOB -> "10"
+        let ac_data = pack_bits("110 10 10");
+        let headers = [(3u16, 16i32), (5u16, -8i32)];
+        let mut rle = Vec::new();
+        vlc_ac_to_rle_with_headers(&ac_data, &headers, AcCodebook::standard(), &mut rle).unwrap();
+        assert_eq!(
+            rle,
+            alloc::vec![
+                (3 << 10) | 16,
+                1,
+                EOB_HALFWORD,
+                (5 << 10) | ((-8i32 as u16) & 0x3FF),
+                EOB_HALFWORD,
+            ]
+        );
+
+        // Invalid q_scale > 63 is rejected.
+        let err =
+            vlc_ac_to_rle_with_headers(&ac_data, &[(64, 0)], AcCodebook::standard(), &mut rle)
+                .unwrap_err();
+        assert!(matches!(err, Error::InvalidParameter(_)));
     }
 }

@@ -17,6 +17,7 @@ use crate::tables::ZIGZAG;
 pub const EOB_HALFWORD: u16 = 0xFE00;
 
 /// Sign-extends a 10-bit two's-complement integer (`0..=1023`) to `i32` (`-512..=511`).
+#[must_use]
 #[inline]
 pub const fn sign_extend_10(raw: u16) -> i32 {
     let v = (raw & 0x3FF) as i32;
@@ -75,30 +76,38 @@ pub fn decode_rle_block(
     let q_scale = i32::from((first >> 10) & 0x3F);
     let dc_raw = sign_extend_10(first);
 
-    let dc = if q_scale == 0 {
-        clamp_i11(dc_raw * 2)
-    } else {
-        clamp_i11(dc_raw * i32::from(quant_zigzag[0]))
-    };
-    out[0] = dc;
-
     let mut k: usize = 0;
-    while k < 63 && pos < rle.len() {
-        let hw = rle[pos];
-        pos += 1;
-        if hw == EOB_HALFWORD {
-            break;
-        }
-        let run = usize::from((hw >> 10) & 0x3F);
-        k += run + 1;
-        if k >= 64 {
-            break;
-        }
-        let ac_raw = sign_extend_10(hw);
-        if q_scale == 0 {
+    if q_scale == 0 {
+        out[0] = clamp_i11(dc_raw * 2);
+        while k < 63 && pos < rle.len() {
+            let hw = rle[pos];
+            pos += 1;
+            if hw == EOB_HALFWORD {
+                break;
+            }
+            let run = usize::from((hw >> 10) & 0x3F);
+            k += run + 1;
+            if k >= 64 {
+                break;
+            }
+            let ac_raw = sign_extend_10(hw);
             out[k] = clamp_i11(ac_raw * 2);
-        } else {
-            out[ZIGZAG[k]] = dequant_ac(ac_raw, quant_zigzag[k], q_scale);
+        }
+    } else {
+        out[0] = clamp_i11(dc_raw * i32::from(quant_zigzag[0]));
+        while k < 63 && pos < rle.len() {
+            let hw = rle[pos];
+            pos += 1;
+            if hw == EOB_HALFWORD {
+                break;
+            }
+            let run = usize::from((hw >> 10) & 0x3F);
+            k += run + 1;
+            if k >= 64 {
+                break;
+            }
+            let ac_raw = sign_extend_10(hw);
+            out[usize::from(ZIGZAG[k])] = dequant_ac(ac_raw, quant_zigzag[k], q_scale);
         }
     }
 
@@ -122,6 +131,7 @@ impl Default for RleBlockDecoder {
 
 impl RleBlockDecoder {
     /// Creates a fresh idle RLE block decoder.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             in_block: false,
@@ -141,12 +151,14 @@ impl RleBlockDecoder {
     }
 
     /// Returns `true` if the decoder has started a block (consumed a DC halfword).
+    #[must_use]
     #[inline]
     pub const fn is_in_block(&self) -> bool {
         self.in_block
     }
 
     /// Returns a reference to the current 8×8 dequantized coefficient buffer.
+    #[must_use]
     #[inline]
     pub const fn coeffs(&self) -> &[i16; 64] {
         &self.coeffs
@@ -192,7 +204,8 @@ impl RleBlockDecoder {
         if self.q_scale == 0 {
             self.coeffs[self.k] = clamp_i11(ac_raw * 2);
         } else {
-            self.coeffs[ZIGZAG[self.k]] = dequant_ac(ac_raw, quant_zigzag[self.k], self.q_scale);
+            self.coeffs[usize::from(ZIGZAG[self.k])] =
+                dequant_ac(ac_raw, quant_zigzag[self.k], self.q_scale);
         }
 
         if self.k == 63 {
@@ -245,7 +258,7 @@ mod tests {
         let mut blk = [0i16; 64];
         decode_rle_block(&rle, &DEFAULT_QUANT_LUMA, &mut blk).unwrap();
         assert_eq!(blk[0], 1022);
-        assert_eq!(blk[ZIGZAG[1]], 1023);
-        assert_eq!(blk[ZIGZAG[2]], -1024);
+        assert_eq!(blk[usize::from(ZIGZAG[1])], 1023);
+        assert_eq!(blk[usize::from(ZIGZAG[2])], -1024);
     }
 }

@@ -118,6 +118,7 @@ pub struct MdecDevice {
 
     // Active command tracking.
     active_cmd: ActiveCommand,
+    after_reset: bool,
     words_remaining: u32,
     current_block: BlockId,
     status_block: BlockId,
@@ -145,6 +146,7 @@ impl Default for MdecDevice {
 impl MdecDevice {
     /// Creates a new [`MdecDevice`] in its power-on / reset state, preloaded
     /// with the standard PS1 quantization and IDCT scale tables.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             quant_luma: DEFAULT_QUANT_LUMA,
@@ -156,6 +158,7 @@ impl MdecDevice {
             output_signed: false,
             set_bit15: false,
             active_cmd: ActiveCommand::Idle,
+            after_reset: true,
             words_remaining: 0,
             current_block: BlockId::Cr,
             status_block: BlockId::Cr,
@@ -181,6 +184,7 @@ impl MdecDevice {
         self.output_signed = false;
         self.set_bit15 = false;
         self.active_cmd = ActiveCommand::Idle;
+        self.after_reset = true;
         self.words_remaining = 0;
         self.current_block = BlockId::Cr;
         self.status_block = BlockId::Cr;
@@ -191,16 +195,19 @@ impl MdecDevice {
     }
 
     /// Returns the currently loaded luminance quantization table (zig-zag order).
+    #[must_use]
     pub const fn quant_luma(&self) -> &[u8; 64] {
         &self.quant_luma
     }
 
     /// Returns the currently loaded chrominance quantization table (zig-zag order).
+    #[must_use]
     pub const fn quant_chroma(&self) -> &[u8; 64] {
         &self.quant_chroma
     }
 
     /// Returns the currently loaded 64×`i16` IDCT scale table.
+    #[must_use]
     pub const fn scale_table(&self) -> &[i16; 64] {
         &self.scale_table
     }
@@ -215,6 +222,7 @@ impl MdecDevice {
     }
 
     /// Reads `MDEC1` (`0x1F801824` — `MDECSTAT`).
+    #[must_use]
     pub fn read_status(&self) -> u32 {
         let mut stat = 0u32;
 
@@ -249,14 +257,7 @@ impl MdecDevice {
         stat |= reported_block.as_bits() << STAT_CURRENT_BLOCK_SHIFT;
 
         let rem = if self.words_remaining == 0 {
-            if self.active_cmd == ActiveCommand::Idle
-                && self.out_fifo.is_empty()
-                && self.output_depth == HardwareDepth::Bit4
-                && !self.output_signed
-                && !self.set_bit15
-                && !self.dma_in_enable
-                && !self.dma_out_enable
-            {
+            if self.after_reset {
                 0
             } else {
                 0xFFFF
@@ -271,18 +272,21 @@ impl MdecDevice {
 
     /// Returns `true` if a command is currently executing or decoded output
     /// remains unread in the Data-Out FIFO.
+    #[must_use]
     #[inline]
     pub fn is_cmd_busy(&self) -> bool {
         self.active_cmd != ActiveCommand::Idle || !self.out_fifo.is_empty()
     }
 
     /// Returns `true` when DMA0 (MDECin) request is asserted.
+    #[must_use]
     #[inline]
     pub fn dma_in_ready(&self) -> bool {
         self.dma_in_enable && self.words_remaining > 0 && !self.in_fifo.is_full()
     }
 
     /// Returns `true` when DMA1 (MDECout) request is asserted.
+    #[must_use]
     #[inline]
     pub fn dma_out_ready(&self) -> bool {
         self.dma_out_enable && !self.out_fifo.is_empty()
@@ -373,13 +377,36 @@ impl MdecDevice {
     ///
     /// Returns the number of words consumed.
     pub fn dma_in(&mut self, words: &[u32]) -> usize {
-        let mut written = 0;
-        for &w in words {
-            if self.words_remaining == 0 || self.in_fifo.is_full() {
-                break;
+        if self.active_cmd != ActiveCommand::DecodeMacroblock {
+            let mut written = 0;
+            for &w in words {
+                if self.words_remaining == 0 || self.in_fifo.is_full() {
+                    break;
+                }
+                self.write_command(w);
+                written += 1;
             }
-            self.write_command(w);
-            written += 1;
+            return written;
+        }
+
+        let mut written = 0;
+        while written < words.len() && self.words_remaining > 0 && !self.in_fifo.is_full() {
+            let batch = (words.len() - written)
+                .min(self.words_remaining as usize)
+                .min(self.in_fifo.free_space());
+            for &w in &words[written..written + batch] {
+                self.in_fifo.push(w);
+            }
+            self.words_remaining -= batch as u32;
+            written += batch;
+            self.step_decode();
+        }
+
+        if self.words_remaining == 0
+            && self.in_fifo.is_empty()
+            && self.pending_hi_halfword.is_none()
+        {
+            self.active_cmd = ActiveCommand::Idle;
         }
         written
     }
@@ -390,18 +417,29 @@ impl MdecDevice {
     /// Returns the number of words written into `out`.
     pub fn dma_out(&mut self, out: &mut [u32]) -> usize {
         let mut read = 0;
-        for slot in out.iter_mut() {
-            if self.out_fifo.is_empty() {
-                break;
+        while read < out.len() && !self.out_fifo.is_empty() {
+            while read < out.len() {
+                let Some(w) = self.out_fifo.pop() else {
+                    break;
+                };
+                out[read] = w;
+                read += 1;
             }
-            *slot = self.read_data();
-            read += 1;
+            self.step_decode();
+            if self.active_cmd == ActiveCommand::DecodeMacroblock
+                && self.words_remaining == 0
+                && self.in_fifo.is_empty()
+                && self.pending_hi_halfword.is_none()
+            {
+                self.active_cmd = ActiveCommand::Idle;
+            }
         }
         read
     }
 
     /// Starts a new command written to `MDEC0`.
     fn start_command(&mut self, word: u32) {
+        self.after_reset = false;
         // All commands latch depth/signed/stp from bits 28..25 into MDECSTAT bits 26..23.
         self.output_depth = HardwareDepth::from_bits(word >> CMD_DEPTH_SHIFT);
         self.output_signed = (word & CMD_SIGNED_BIT) != 0;
@@ -588,5 +626,37 @@ impl MdecDevice {
             }
             HardwareDepth::Bit4 | HardwareDepth::Bit8 => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registers::{CMD_OPCODE_SHIFT, STAT_RESET_VALUE};
+    use crate::rle::EOB_HALFWORD;
+
+    #[test]
+    fn mdecstat_remaining_distinguishes_reset_from_completed_bit4_decode() {
+        let mut dev = MdecDevice::new();
+        assert_eq!(dev.read_status(), STAT_RESET_VALUE);
+        assert_eq!(dev.read_status() & STAT_REMAINING_MASK, 0);
+
+        // Run a Bit4, unsigned, non-DMA MDEC(1) decode of 1 word (DC=0, EOB).
+        let word = u32::from(EOB_HALFWORD) << 16;
+        dev.write_command((1 << CMD_OPCODE_SHIFT) | 1);
+        dev.write_command(word);
+        for _ in 0..8 {
+            let _ = dev.read_data();
+        }
+
+        // Completed decode must report 0xFFFF in remaining field (even in Bit4 unsigned non-DMA).
+        let stat = dev.read_status();
+        assert_eq!(stat & STAT_CMD_BUSY, 0);
+        assert_eq!(stat & STAT_DATA_OUT_FIFO_EMPTY, STAT_DATA_OUT_FIFO_EMPTY);
+        assert_eq!(stat & STAT_REMAINING_MASK, 0xFFFF);
+
+        // Hardware reset returns remaining field to 0x0000.
+        dev.reset();
+        assert_eq!(dev.read_status(), STAT_RESET_VALUE);
     }
 }

@@ -104,6 +104,7 @@ pub enum CommandOpcode {
 
 impl CommandOpcode {
     /// Extracts the 3-bit command opcode from an `MDEC0` command word.
+    #[must_use]
     #[inline]
     pub const fn from_word(word: u32) -> Self {
         match (word >> CMD_OPCODE_SHIFT) & CMD_OPCODE_MASK {
@@ -119,6 +120,7 @@ impl CommandOpcode {
     }
 
     /// Returns the numeric 3-bit opcode (`0..=7`).
+    #[must_use]
     #[inline]
     pub const fn as_u8(self) -> u8 {
         self as u8
@@ -141,6 +143,7 @@ pub enum HardwareDepth {
 
 impl HardwareDepth {
     /// Decodes the 2-bit depth field (`0..=3`).
+    #[must_use]
     #[inline]
     pub const fn from_bits(bits: u32) -> Self {
         match bits & 0b11 {
@@ -152,12 +155,14 @@ impl HardwareDepth {
     }
 
     /// Returns the 2-bit encoding (`0..=3`).
+    #[must_use]
     #[inline]
     pub const fn as_bits(self) -> u32 {
         self as u32
     }
 
     /// Returns `true` for monochrome modes (`Bit4` and `Bit8`).
+    #[must_use]
     #[inline]
     pub const fn is_mono(self) -> bool {
         matches!(self, Self::Bit4 | Self::Bit8)
@@ -184,6 +189,7 @@ pub enum BlockId {
 
 impl BlockId {
     /// Returns the 3-bit status register encoding (`0..=5`).
+    #[must_use]
     #[inline]
     pub const fn as_bits(self) -> u32 {
         self as u32

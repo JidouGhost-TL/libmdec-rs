@@ -11,6 +11,7 @@
 
 /// Clamps an `i32` to the signed 8-bit range `-128..=127`, then converts to `u8`
 /// according to `signed` (`false` adds `128` for `0..=255`; `true` keeps two's complement).
+#[must_use]
 #[inline]
 pub const fn clamp_channel(v: i32, signed: bool) -> u8 {
     let c = if v < -128 {
@@ -27,32 +28,37 @@ pub const fn clamp_channel(v: i32, signed: bool) -> u8 {
     }
 }
 
+/// Computes the fixed-point `(R, G, B)` chroma offsets for a `(Cr, Cb)` sample.
+#[inline]
+const fn chroma_offsets(cr: i16, cb: i16) -> (i32, i32, i32) {
+    let cr = cr as i32;
+    let cb = cb as i32;
+    ((359 * cr) >> 8, (-88 * cb - 183 * cr) >> 8, (454 * cb) >> 8)
+}
+
 /// Converts a single `(Y, Cr, Cb)` pixel (each in `-128..=127`) to `[R, G, B]`.
 ///
 /// Uses the PS1 MDEC fixed-point coefficients:
 /// - `R = Y + ((359 * Cr) >> 8)` (`1.40234375 * Cr`)
 /// - `G = Y + ((-88 * Cb - 183 * Cr) >> 8)` (`-0.34375 * Cb - 0.71484375 * Cr`)
 /// - `B = Y + ((454 * Cb) >> 8)` (`1.7734375 * Cb`)
+#[must_use]
 #[inline]
 pub const fn ycbcr_to_rgb(y: i16, cr: i16, cb: i16, signed: bool) -> [u8; 3] {
     let y = y as i32;
-    let cr = cr as i32;
-    let cb = cb as i32;
-
-    let r = y + ((359 * cr) >> 8);
-    let g = y + ((-88 * cb - 183 * cr) >> 8);
-    let b = y + ((454 * cb) >> 8);
+    let (r_off, g_off, b_off) = chroma_offsets(cr, cb);
 
     [
-        clamp_channel(r, signed),
-        clamp_channel(g, signed),
-        clamp_channel(b, signed),
+        clamp_channel(y + r_off, signed),
+        clamp_channel(y + g_off, signed),
+        clamp_channel(y + b_off, signed),
     ]
 }
 
 /// Packs 8-bit `[R, G, B]` channels into PS1 15-bit `RGB555` (`0bbbbbgggggrrrrr`),
 /// rounding to the nearest 5-bit level (matching retail PS1 hardware) and
 /// setting bit 15 when `stp` is `true`.
+#[must_use]
 #[inline]
 pub const fn rgb8_to_rgb15(r: u8, g: u8, b: u8, stp: bool) -> u16 {
     let r5 = (r as u16 + 4) >> 3;
@@ -66,6 +72,7 @@ pub const fn rgb8_to_rgb15(r: u8, g: u8, b: u8, stp: bool) -> u16 {
 }
 
 /// Converts a single 8-bit monochrome sample (`-128..=127`) to `u8`.
+#[must_use]
 #[inline]
 pub const fn y_to_gray8(y: i16, signed: bool) -> u8 {
     clamp_channel(y as i32, signed)
@@ -75,6 +82,7 @@ pub const fn y_to_gray8(y: i16, signed: bool) -> u8 {
 ///
 /// Retail PS1 hardware rounds to the nearest 4-bit level (`(u + 8) >> 4`, clamped to 15)
 /// in unsigned mode, or arithmetic-shifts in signed mode.
+#[must_use]
 #[inline]
 pub const fn y_to_gray4_nibble(y: i16, signed: bool) -> u8 {
     let c = if y < -128 {
@@ -116,10 +124,48 @@ pub fn convert_mono_4bit(y: &[i16; 64], signed: bool, out: &mut [u8; 32]) {
     }
 }
 
+/// Converts an 8×8 monochrome block directly into a strided 4-bit raster buffer
+/// (4 bytes per row, `stride` bytes between rows).
+#[inline]
+pub(crate) fn convert_mono_4bit_strided(
+    y: &[i16; 64],
+    signed: bool,
+    out: &mut [u8],
+    stride: usize,
+) {
+    for row in 0..8 {
+        let y_row = &y[row * 8..row * 8 + 8];
+        let dst = &mut out[row * stride..row * stride + 4];
+        for col in 0..4 {
+            let lo = y_to_gray4_nibble(y_row[col * 2], signed);
+            let hi = y_to_gray4_nibble(y_row[col * 2 + 1], signed);
+            dst[col] = (hi << 4) | lo;
+        }
+    }
+}
+
 /// Converts an 8×8 monochrome block into 64 8-bit grayscale bytes.
 pub fn convert_mono_8bit(y: &[i16; 64], signed: bool, out: &mut [u8; 64]) {
     for i in 0..64 {
         out[i] = y_to_gray8(y[i], signed);
+    }
+}
+
+/// Converts an 8×8 monochrome block directly into a strided 8-bit raster buffer
+/// (8 bytes per row, `stride` bytes between rows).
+#[inline]
+pub(crate) fn convert_mono_8bit_strided(
+    y: &[i16; 64],
+    signed: bool,
+    out: &mut [u8],
+    stride: usize,
+) {
+    for row in 0..8 {
+        let y_row = &y[row * 8..row * 8 + 8];
+        let dst = &mut out[row * stride..row * stride + 8];
+        for col in 0..8 {
+            dst[col] = y_to_gray8(y_row[col], signed);
+        }
     }
 }
 
@@ -136,15 +182,24 @@ pub fn convert_subblock_rgb15(
     stp: bool,
     out: &mut [u16; 64],
 ) {
-    for row in 0..8 {
-        let cy = quad_y + (row >> 1);
-        for col in 0..8 {
-            let cx = quad_x + (col >> 1);
-            let y_val = y_blk[row * 8 + col];
-            let cr_val = cr[cy * 8 + cx];
-            let cb_val = cb[cy * 8 + cx];
-            let [r, g, b] = ycbcr_to_rgb(y_val, cr_val, cb_val, signed);
-            out[row * 8 + col] = rgb8_to_rgb15(r, g, b, stp);
+    for qy in 0..4 {
+        let cy = quad_y + qy;
+        let r0 = qy * 2;
+        let r1 = r0 + 1;
+        for qx in 0..4 {
+            let cx = quad_x + qx;
+            let (r_off, g_off, b_off) = chroma_offsets(cr[cy * 8 + cx], cb[cy * 8 + cx]);
+            let c0 = qx * 2;
+            let c1 = c0 + 1;
+
+            for (row, col) in [(r0, c0), (r0, c1), (r1, c0), (r1, c1)] {
+                let idx = row * 8 + col;
+                let yv = i32::from(y_blk[idx]);
+                let r = clamp_channel(yv + r_off, signed);
+                let g = clamp_channel(yv + g_off, signed);
+                let b = clamp_channel(yv + b_off, signed);
+                out[idx] = rgb8_to_rgb15(r, g, b, stp);
+            }
         }
     }
 }
@@ -159,18 +214,75 @@ pub fn convert_subblock_rgb24(
     signed: bool,
     out: &mut [u8; 192],
 ) {
-    for row in 0..8 {
-        let cy = quad_y + (row >> 1);
-        for col in 0..8 {
-            let cx = quad_x + (col >> 1);
-            let y_val = y_blk[row * 8 + col];
-            let cr_val = cr[cy * 8 + cx];
-            let cb_val = cb[cy * 8 + cx];
-            let [r, g, b] = ycbcr_to_rgb(y_val, cr_val, cb_val, signed);
-            let off = (row * 8 + col) * 3;
-            out[off] = r;
-            out[off + 1] = g;
-            out[off + 2] = b;
+    for qy in 0..4 {
+        let cy = quad_y + qy;
+        let r0 = qy * 2;
+        let r1 = r0 + 1;
+        for qx in 0..4 {
+            let cx = quad_x + qx;
+            let (r_off, g_off, b_off) = chroma_offsets(cr[cy * 8 + cx], cb[cy * 8 + cx]);
+            let c0 = qx * 2;
+            let c1 = c0 + 1;
+
+            for (row, col) in [(r0, c0), (r0, c1), (r1, c0), (r1, c1)] {
+                let idx = row * 8 + col;
+                let yv = i32::from(y_blk[idx]);
+                let off = idx * 3;
+                out[off] = clamp_channel(yv + r_off, signed);
+                out[off + 1] = clamp_channel(yv + g_off, signed);
+                out[off + 2] = clamp_channel(yv + b_off, signed);
+            }
+        }
+    }
+}
+
+/// Converts a full 16×16 macroblock (`y = [Y0, Y1, Y2, Y3]`, `cr`, `cb`) directly
+/// into a strided RGB24 raster buffer (`stride` bytes between rows).
+#[inline]
+pub(crate) fn convert_macroblock_rgb24_strided(
+    y: &[[i16; 64]; 4],
+    cr: &[i16; 64],
+    cb: &[i16; 64],
+    signed: bool,
+    out: &mut [u8],
+    stride: usize,
+) {
+    for by in 0..2 {
+        for bx in 0..2 {
+            let y_blk = &y[by * 2 + bx];
+            for qy in 0..4 {
+                let cy = by * 4 + qy;
+                let row0 = by * 8 + qy * 2;
+                let row1 = row0 + 1;
+                let ly0 = qy * 2;
+                let ly1 = ly0 + 1;
+                for qx in 0..4 {
+                    let cx = bx * 4 + qx;
+                    let (r_off, g_off, b_off) = chroma_offsets(cr[cy * 8 + cx], cb[cy * 8 + cx]);
+                    let col0 = bx * 8 + qx * 2;
+                    let lx0 = qx * 2;
+
+                    let off0 = row0 * stride + col0 * 3;
+                    let y00 = i32::from(y_blk[ly0 * 8 + lx0]);
+                    let y01 = i32::from(y_blk[ly0 * 8 + lx0 + 1]);
+                    out[off0] = clamp_channel(y00 + r_off, signed);
+                    out[off0 + 1] = clamp_channel(y00 + g_off, signed);
+                    out[off0 + 2] = clamp_channel(y00 + b_off, signed);
+                    out[off0 + 3] = clamp_channel(y01 + r_off, signed);
+                    out[off0 + 4] = clamp_channel(y01 + g_off, signed);
+                    out[off0 + 5] = clamp_channel(y01 + b_off, signed);
+
+                    let off1 = row1 * stride + col0 * 3;
+                    let y10 = i32::from(y_blk[ly1 * 8 + lx0]);
+                    let y11 = i32::from(y_blk[ly1 * 8 + lx0 + 1]);
+                    out[off1] = clamp_channel(y10 + r_off, signed);
+                    out[off1 + 1] = clamp_channel(y10 + g_off, signed);
+                    out[off1 + 2] = clamp_channel(y10 + b_off, signed);
+                    out[off1 + 3] = clamp_channel(y11 + r_off, signed);
+                    out[off1 + 4] = clamp_channel(y11 + g_off, signed);
+                    out[off1 + 5] = clamp_channel(y11 + b_off, signed);
+                }
+            }
         }
     }
 }
@@ -184,20 +296,60 @@ pub fn convert_macroblock_rgb24(
     signed: bool,
     out: &mut [u8; 768],
 ) {
-    for row in 0..16 {
-        let by = row >> 3;
-        let ly = row & 7;
-        let cy = row >> 1;
-        for col in 0..16 {
-            let bx = col >> 3;
-            let lx = col & 7;
-            let cx = col >> 1;
-            let y_val = y[by * 2 + bx][ly * 8 + lx];
-            let [r, g, b] = ycbcr_to_rgb(y_val, cr[cy * 8 + cx], cb[cy * 8 + cx], signed);
-            let off = (row * 16 + col) * 3;
-            out[off] = r;
-            out[off + 1] = g;
-            out[off + 2] = b;
+    convert_macroblock_rgb24_strided(y, cr, cb, signed, out, 16 * 3);
+}
+
+/// Converts a full 16×16 macroblock directly into a strided RGBA32 raster buffer
+/// (`stride` bytes between rows, alpha = `0xFF`).
+#[inline]
+pub(crate) fn convert_macroblock_rgba32_strided(
+    y: &[[i16; 64]; 4],
+    cr: &[i16; 64],
+    cb: &[i16; 64],
+    signed: bool,
+    out: &mut [u8],
+    stride: usize,
+) {
+    for by in 0..2 {
+        for bx in 0..2 {
+            let y_blk = &y[by * 2 + bx];
+            for qy in 0..4 {
+                let cy = by * 4 + qy;
+                let row0 = by * 8 + qy * 2;
+                let row1 = row0 + 1;
+                let ly0 = qy * 2;
+                let ly1 = ly0 + 1;
+                for qx in 0..4 {
+                    let cx = bx * 4 + qx;
+                    let (r_off, g_off, b_off) = chroma_offsets(cr[cy * 8 + cx], cb[cy * 8 + cx]);
+                    let col0 = bx * 8 + qx * 2;
+                    let lx0 = qx * 2;
+
+                    let off0 = row0 * stride + col0 * 4;
+                    let y00 = i32::from(y_blk[ly0 * 8 + lx0]);
+                    let y01 = i32::from(y_blk[ly0 * 8 + lx0 + 1]);
+                    out[off0] = clamp_channel(y00 + r_off, signed);
+                    out[off0 + 1] = clamp_channel(y00 + g_off, signed);
+                    out[off0 + 2] = clamp_channel(y00 + b_off, signed);
+                    out[off0 + 3] = 0xFF;
+                    out[off0 + 4] = clamp_channel(y01 + r_off, signed);
+                    out[off0 + 5] = clamp_channel(y01 + g_off, signed);
+                    out[off0 + 6] = clamp_channel(y01 + b_off, signed);
+                    out[off0 + 7] = 0xFF;
+
+                    let off1 = row1 * stride + col0 * 4;
+                    let y10 = i32::from(y_blk[ly1 * 8 + lx0]);
+                    let y11 = i32::from(y_blk[ly1 * 8 + lx0 + 1]);
+                    out[off1] = clamp_channel(y10 + r_off, signed);
+                    out[off1 + 1] = clamp_channel(y10 + g_off, signed);
+                    out[off1 + 2] = clamp_channel(y10 + b_off, signed);
+                    out[off1 + 3] = 0xFF;
+                    out[off1 + 4] = clamp_channel(y11 + r_off, signed);
+                    out[off1 + 5] = clamp_channel(y11 + g_off, signed);
+                    out[off1 + 6] = clamp_channel(y11 + b_off, signed);
+                    out[off1 + 7] = 0xFF;
+                }
+            }
         }
     }
 }
@@ -211,21 +363,81 @@ pub fn convert_macroblock_rgba32(
     signed: bool,
     out: &mut [u8; 1024],
 ) {
-    for row in 0..16 {
-        let by = row >> 3;
-        let ly = row & 7;
-        let cy = row >> 1;
-        for col in 0..16 {
-            let bx = col >> 3;
-            let lx = col & 7;
-            let cx = col >> 1;
-            let y_val = y[by * 2 + bx][ly * 8 + lx];
-            let [r, g, b] = ycbcr_to_rgb(y_val, cr[cy * 8 + cx], cb[cy * 8 + cx], signed);
-            let off = (row * 16 + col) * 4;
-            out[off] = r;
-            out[off + 1] = g;
-            out[off + 2] = b;
-            out[off + 3] = 0xFF;
+    convert_macroblock_rgba32_strided(y, cr, cb, signed, out, 16 * 4);
+}
+
+/// Converts a full 16×16 macroblock directly into a strided little-endian RGB15
+/// raster buffer (`stride` bytes between rows).
+#[inline]
+pub(crate) fn convert_macroblock_rgb15_le_strided(
+    y: &[[i16; 64]; 4],
+    cr: &[i16; 64],
+    cb: &[i16; 64],
+    signed: bool,
+    stp: bool,
+    out: &mut [u8],
+    stride: usize,
+) {
+    for by in 0..2 {
+        for bx in 0..2 {
+            let y_blk = &y[by * 2 + bx];
+            for qy in 0..4 {
+                let cy = by * 4 + qy;
+                let row0 = by * 8 + qy * 2;
+                let row1 = row0 + 1;
+                let ly0 = qy * 2;
+                let ly1 = ly0 + 1;
+                for qx in 0..4 {
+                    let cx = bx * 4 + qx;
+                    let (r_off, g_off, b_off) = chroma_offsets(cr[cy * 8 + cx], cb[cy * 8 + cx]);
+                    let col0 = bx * 8 + qx * 2;
+                    let lx0 = qx * 2;
+
+                    let off0 = row0 * stride + col0 * 2;
+                    let y00 = i32::from(y_blk[ly0 * 8 + lx0]);
+                    let y01 = i32::from(y_blk[ly0 * 8 + lx0 + 1]);
+                    let p00 = rgb8_to_rgb15(
+                        clamp_channel(y00 + r_off, signed),
+                        clamp_channel(y00 + g_off, signed),
+                        clamp_channel(y00 + b_off, signed),
+                        stp,
+                    )
+                    .to_le_bytes();
+                    let p01 = rgb8_to_rgb15(
+                        clamp_channel(y01 + r_off, signed),
+                        clamp_channel(y01 + g_off, signed),
+                        clamp_channel(y01 + b_off, signed),
+                        stp,
+                    )
+                    .to_le_bytes();
+                    out[off0] = p00[0];
+                    out[off0 + 1] = p00[1];
+                    out[off0 + 2] = p01[0];
+                    out[off0 + 3] = p01[1];
+
+                    let off1 = row1 * stride + col0 * 2;
+                    let y10 = i32::from(y_blk[ly1 * 8 + lx0]);
+                    let y11 = i32::from(y_blk[ly1 * 8 + lx0 + 1]);
+                    let p10 = rgb8_to_rgb15(
+                        clamp_channel(y10 + r_off, signed),
+                        clamp_channel(y10 + g_off, signed),
+                        clamp_channel(y10 + b_off, signed),
+                        stp,
+                    )
+                    .to_le_bytes();
+                    let p11 = rgb8_to_rgb15(
+                        clamp_channel(y11 + r_off, signed),
+                        clamp_channel(y11 + g_off, signed),
+                        clamp_channel(y11 + b_off, signed),
+                        stp,
+                    )
+                    .to_le_bytes();
+                    out[off1] = p10[0];
+                    out[off1 + 1] = p10[1];
+                    out[off1 + 2] = p11[0];
+                    out[off1 + 3] = p11[1];
+                }
+            }
         }
     }
 }
@@ -239,17 +451,52 @@ pub fn convert_macroblock_rgb15(
     stp: bool,
     out: &mut [u16; 256],
 ) {
-    for row in 0..16 {
-        let by = row >> 3;
-        let ly = row & 7;
-        let cy = row >> 1;
-        for col in 0..16 {
-            let bx = col >> 3;
-            let lx = col & 7;
-            let cx = col >> 1;
-            let y_val = y[by * 2 + bx][ly * 8 + lx];
-            let [r, g, b] = ycbcr_to_rgb(y_val, cr[cy * 8 + cx], cb[cy * 8 + cx], signed);
-            out[row * 16 + col] = rgb8_to_rgb15(r, g, b, stp);
+    for by in 0..2 {
+        for bx in 0..2 {
+            let y_blk = &y[by * 2 + bx];
+            for qy in 0..4 {
+                let cy = by * 4 + qy;
+                let row0 = by * 8 + qy * 2;
+                let row1 = row0 + 1;
+                let ly0 = qy * 2;
+                let ly1 = ly0 + 1;
+                for qx in 0..4 {
+                    let cx = bx * 4 + qx;
+                    let (r_off, g_off, b_off) = chroma_offsets(cr[cy * 8 + cx], cb[cy * 8 + cx]);
+                    let col0 = bx * 8 + qx * 2;
+                    let lx0 = qx * 2;
+
+                    let y00 = i32::from(y_blk[ly0 * 8 + lx0]);
+                    let y01 = i32::from(y_blk[ly0 * 8 + lx0 + 1]);
+                    out[row0 * 16 + col0] = rgb8_to_rgb15(
+                        clamp_channel(y00 + r_off, signed),
+                        clamp_channel(y00 + g_off, signed),
+                        clamp_channel(y00 + b_off, signed),
+                        stp,
+                    );
+                    out[row0 * 16 + col0 + 1] = rgb8_to_rgb15(
+                        clamp_channel(y01 + r_off, signed),
+                        clamp_channel(y01 + g_off, signed),
+                        clamp_channel(y01 + b_off, signed),
+                        stp,
+                    );
+
+                    let y10 = i32::from(y_blk[ly1 * 8 + lx0]);
+                    let y11 = i32::from(y_blk[ly1 * 8 + lx0 + 1]);
+                    out[row1 * 16 + col0] = rgb8_to_rgb15(
+                        clamp_channel(y10 + r_off, signed),
+                        clamp_channel(y10 + g_off, signed),
+                        clamp_channel(y10 + b_off, signed),
+                        stp,
+                    );
+                    out[row1 * 16 + col0 + 1] = rgb8_to_rgb15(
+                        clamp_channel(y11 + r_off, signed),
+                        clamp_channel(y11 + g_off, signed),
+                        clamp_channel(y11 + b_off, signed),
+                        stp,
+                    );
+                }
+            }
         }
     }
 }

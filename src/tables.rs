@@ -10,7 +10,7 @@
 /// Zig-zag scan order. `ZIGZAG[k]` is the natural (row-major) 8×8 index
 /// occupied by the `k`-th coefficient in zig-zag scan order.
 #[rustfmt::skip]
-pub const ZIGZAG: [usize; 64] = [
+pub const ZIGZAG: [u8; 64] = [
      0,  1,  8, 16,  9,  2,  3, 10,
     17, 24, 32, 25, 18, 11,  4,  5,
     12, 19, 26, 33, 40, 48, 41, 34,
@@ -66,22 +66,24 @@ pub const DEFAULT_SCALE_TABLE: [i16; 64] = [
 ];
 
 /// Converts a quantization matrix from natural (row-major) order to hardware zig-zag order.
+#[must_use]
 pub const fn quant_natural_to_zigzag(natural: &[u8; 64]) -> [u8; 64] {
     let mut out = [0u8; 64];
     let mut k = 0;
     while k < 64 {
-        out[k] = natural[ZIGZAG[k]];
+        out[k] = natural[ZIGZAG[k] as usize];
         k += 1;
     }
     out
 }
 
 /// Converts a quantization matrix from hardware zig-zag order to natural (row-major) order.
+#[must_use]
 pub const fn quant_zigzag_to_natural(zigzag: &[u8; 64]) -> [u8; 64] {
     let mut out = [0u8; 64];
     let mut k = 0;
     while k < 64 {
-        out[ZIGZAG[k]] = zigzag[k];
+        out[ZIGZAG[k] as usize] = zigzag[k];
         k += 1;
     }
     out
@@ -206,6 +208,7 @@ pub enum Component {
 }
 
 /// Returns the BS v3 DC-difference Huffman table for `component`.
+#[must_use]
 #[inline]
 pub const fn dc_table(component: Component) -> &'static [DcCode; 9] {
     match component {
@@ -352,6 +355,7 @@ mod tests {
     fn zigzag_is_valid_permutation() {
         let mut seen = [false; 64];
         for &idx in &ZIGZAG {
+            let idx = usize::from(idx);
             assert!(!seen[idx]);
             seen[idx] = true;
         }

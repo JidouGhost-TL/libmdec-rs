@@ -16,8 +16,15 @@
 //! - [`rle`], [`idct`], [`color`], [`tables`], [`registers`]: composable
 //!   building blocks for emulators, tools, and decoders.
 
+#![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate std;
 
 pub mod color;
 pub mod decoder;
@@ -28,18 +35,18 @@ pub mod rle;
 pub mod tables;
 pub mod vlc;
 
-use std::fmt;
+use core::fmt;
 
 pub use decoder::{Decoder, OutputDepth};
 pub use device::MdecDevice;
 pub use registers::{BlockId, CommandOpcode, HardwareDepth};
-pub use vlc::{
-    vlc0_bitcodes, vlc_to_rle, vlc_to_rle_with_block_headers, AcCodeEntry, AcCodebook, AcEscape,
-    AcEvent, BitReader, DcCoding,
-};
+pub use vlc::{vlc0_bitcodes, AcCodeEntry, AcCodebook, AcEscape, AcEvent, BitReader, DcCoding};
+#[cfg(feature = "alloc")]
+pub use vlc::{vlc_ac_to_rle_with_headers, vlc_to_rle, vlc_to_rle_with_block_headers};
 
 /// Error type returned by fallible `libmdec` operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Input bitstream or RLE slice ended before the expected block/frame completed.
     UnexpectedEof,
@@ -85,6 +92,7 @@ impl fmt::Display for Error {
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
 #[cfg(test)]
