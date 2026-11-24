@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.70"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/JidouGhost-TL/libmdec-rs"
 description = "Standalone pure-Rust PlayStation 1 MDEC hardware video decoder and BS bitstream library"
 keywords = ["ps1", "psx", "playstation", "mdec", "video"]
 categories = ["multimedia::video", "emulators"]
